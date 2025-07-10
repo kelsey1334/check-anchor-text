@@ -16,10 +16,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 
-# Quản lý tiến trình theo user_id
 USER_TASKS = {}
-
-# Helper như cũ...
 
 def detect_page_type(soup):
     if soup.find('div', class_='article-inner'):
@@ -61,7 +58,7 @@ async def check_link_status(session, url):
     except Exception:
         return None
 
-async def process_url(session, url, stt):
+async def process_url(session, url, stt, page_type=None):
     try:
         async with session.get(url, timeout=15) as resp:
             if resp.status != 200:
@@ -71,7 +68,9 @@ async def process_url(session, url, stt):
         return [stt, url, "Không truy cập được URL", url, "", "", ""]
     
     soup = BeautifulSoup(html, "html.parser")
-    page_type = detect_page_type(soup)
+    # Nếu page_type không có, tự động detect
+    if not page_type:
+        page_type = detect_page_type(soup)
     if not page_type:
         return [stt, url, "Không nhận diện dạng bài", url, "", "", ""]
     content = extract_content(soup, page_type)
@@ -99,7 +98,30 @@ async def handle_excel(
 ):
     wb = load_workbook(file_path)
     ws = wb.active
-    urls = [row[0].value for row in ws.iter_rows(min_row=2, min_col=1, max_col=1) if row[0].value]
+    # Lấy header (giả sử dòng đầu tiên)
+    headers = [cell.value for cell in ws[1]]
+    url_idx = None
+    type_idx = None
+    for idx, val in enumerate(headers):
+        if val and str(val).strip().lower() == 'url':
+            url_idx = idx
+        if val and str(val).strip().lower() == 'type':
+            type_idx = idx
+    if url_idx is None:
+        await context.bot.send_message(chat_id=chat_id, text="Không tìm thấy cột 'url' trong file.")
+        return
+
+    # Đọc dữ liệu từng dòng
+    urls_types = []
+    for row in ws.iter_rows(min_row=2, max_col=max(url_idx, type_idx if type_idx is not None else 0)+1):
+        url = row[url_idx].value if url_idx < len(row) else None
+        page_type = None
+        if type_idx is not None and type_idx < len(row):
+            page_type = row[type_idx].value
+            if page_type:
+                page_type = str(page_type).strip().lower()
+        if url:
+            urls_types.append((url, page_type))
 
     result_wb = Workbook()
     result_ws = result_wb.active
@@ -110,27 +132,29 @@ async def handle_excel(
     ])
 
     async with aiohttp.ClientSession() as session:
-        for i, url in enumerate(urls, 1):
+        for i, (url, page_type) in enumerate(urls_types, 1):
             # Kiểm tra cờ huỷ
             if USER_TASKS.get(user_id, {}).get("cancel", False):
-                await context.bot.send_message(chat_id=chat_id, text=f"Đã dừng tiến trình theo yêu cầu! Dừng ở dòng {i}/{len(urls)}.")
+                await context.bot.send_message(chat_id=chat_id, text=f"Đã dừng tiến trình theo yêu cầu! Dừng ở dòng {i}/{len(urls_types)}.")
                 break
-            await context.bot.send_message(chat_id=chat_id, text=f"Đang kiểm tra {i}/{len(urls)}: {url}")
-            row = await process_url(session, url, i)
+            await context.bot.send_message(chat_id=chat_id, text=f"Đang kiểm tra {i}/{len(urls_types)}: {url} ({page_type if page_type else 'auto'})")
+            row = await process_url(session, url, i, page_type)
             result_ws.append(row)
-            # Gửi log mỗi 5 dòng hoặc mỗi dòng, tuỳ chọn (giảm spam nếu muốn)
-            # if i % 5 == 0 or i == len(urls):
-            #    await context.bot.send_message(chat_id=chat_id, text=f"Đã xong {i}/{len(urls)} URL.")
+            # Có thể gửi log sau mỗi 5 dòng nếu muốn
     result_wb.save(output_path)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Gửi file Excel chứa danh sách URL vào đây.\nNếu muốn hủy kiểm tra khi đang chạy, gửi /cancel.")
+    await update.message.reply_text(
+        "Gửi file Excel (.xlsx) chứa danh sách URL cần kiểm tra.\n"
+        "Có thể gửi dạng 2 cột: url, type (post/page/category).\n"
+        "Nếu không có cột 'type', bot sẽ tự đoán.\n"
+        "Gửi /cancel để dừng tiến trình."
+    )
 
 async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # Ghi nhận cờ không hủy
     USER_TASKS[user_id] = {"cancel": False}
 
     if update.message.document.mime_type not in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']:
@@ -143,7 +167,6 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Đang xử lý, vui lòng đợi... (có thể gửi /cancel để dừng lại)")
 
-    # Chạy tiến trình và ghi nhận task
     try:
         await handle_excel(input_path, output_path, context, chat_id, user_id)
     except Exception as ex:
