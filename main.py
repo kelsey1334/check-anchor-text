@@ -2,7 +2,7 @@ import os
 import requests
 import logging
 from bs4 import BeautifulSoup
-from openpyxl import load_workbook, Workbook
+from openpyxl import Workbook, load_workbook
 from dotenv import load_dotenv
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -12,10 +12,9 @@ from telegram.ext import (
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 logging.basicConfig(level=logging.INFO)
-
 USER_TASKS = {}
 
-def find_internal_links_from_html(html, base_url):
+def find_internal_links(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
@@ -23,7 +22,6 @@ def find_internal_links_from_html(html, base_url):
         anchor = a.text.strip()
         if not anchor:
             continue
-        # Logic internal: bắt đầu / hoặc có base_url (domain)
         if href.startswith("/") or base_url in href:
             full_link = href if href.startswith("http") else base_url.rstrip("/") + "/" + href.lstrip("/")
             links.append((anchor, full_link))
@@ -37,39 +35,17 @@ def get_base_url(url):
     except Exception:
         return url
 
-def check_link_status(url):
+def get_status(url):
     try:
-        r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'})
+        r = requests.get(url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        })
         return r.status_code
     except Exception:
-        return None
+        return "ERR"
 
-def process_url(url, stt):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
-    try:
-        resp = requests.get(url, timeout=15, headers=headers)
-        status = resp.status_code
-        if status != 200:
-            return [stt, url, f"URL lỗi: status {status}", url]
-        html = resp.text
-    except Exception as e:
-        return [stt, url, f"Không truy cập được URL: {str(e)}", url]
-    
-    base_url = get_base_url(url)
-    internal_links = find_internal_links_from_html(html, base_url)
-    result_row = [stt, url]
-    error_found = False
-    for anchor, link in internal_links:
-        code = check_link_status(link)
-        if code in [301, 404]:
-            error_found = True
-            result_row.append(f"{anchor} - {link} (status {code})")
-    if not error_found:
-        result_row.append("OK")
-    return result_row
-
-def handle_excel(file_path, output_path):
-    wb = load_workbook(file_path)
+async def handle_excel(input_path, output_path, context, chat_id):
+    wb = load_workbook(input_path)
     ws = wb.active
     headers = [cell.value for cell in ws[1]]
     url_idx = None
@@ -77,37 +53,51 @@ def handle_excel(file_path, output_path):
         if val and str(val).strip().lower() == 'url':
             url_idx = idx
     if url_idx is None:
-        raise Exception("Không tìm thấy cột 'url' trong file.")
+        await context.bot.send_message(chat_id=chat_id, text="Không tìm thấy cột 'url' trong file.")
+        return
     urls = []
     for row in ws.iter_rows(min_row=2, max_col=url_idx+1):
         url = row[url_idx].value if url_idx < len(row) else None
         if url:
             urls.append(url)
 
-    result_rows = []
-    max_error = 0
-
-    for i, url in enumerate(urls, 1):
-        row = process_url(url, i)
-        # trừ 2 cột đầu là stt, url
-        num_error = len(row) - 2
-        max_error = max(max_error, num_error)
-        result_rows.append(row)
-
-    # Header động, số cột lỗi tối đa từng gặp
-    header = ['stt', 'url check'] + [f'anchor lỗi {i+1}' for i in range(max_error if max_error > 0 else 1)]
     result_wb = Workbook()
     result_ws = result_wb.active
-    result_ws.append(header)
+    result_ws.append(["Source URL", "Anchor Text", "Destination URL", "Response Code"])
 
-    # Fill dòng cho đủ cột
-    for row in result_rows:
-        while len(row) < len(header):
-            row.append("")
-        result_ws.append(row)
+    for i, src_url in enumerate(urls, 1):
+        try:
+            resp = requests.get(src_url, timeout=15, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            })
+            if resp.status_code != 200:
+                result_ws.append([src_url, "", src_url, resp.status_code])
+                await context.bot.send_message(chat_id=chat_id, text=f"{i}/{len(urls)}: {src_url} --> {resp.status_code}")
+                continue
+            html = resp.text
+        except Exception as e:
+            result_ws.append([src_url, "", src_url, "ERR"])
+            await context.bot.send_message(chat_id=chat_id, text=f"{i}/{len(urls)}: {src_url} --> ERR")
+            continue
+
+        base_url = get_base_url(src_url)
+        internal_links = find_internal_links(html, base_url)
+        if not internal_links:
+            result_ws.append([src_url, "", "", "No Internal Link"])
+            await context.bot.send_message(chat_id=chat_id, text=f"{i}/{len(urls)}: {src_url} --> No Internal Link")
+            continue
+
+        error_count = 0
+        for anchor, dst_url in internal_links:
+            code = get_status(dst_url)
+            result_ws.append([src_url, anchor, dst_url, code])
+            if code not in [200, 201, 202]:
+                error_count += 1
+
+        await context.bot.send_message(chat_id=chat_id, text=f"{i}/{len(urls)}: {src_url} --> Found {len(internal_links)} internal links, {error_count} lỗi")
+
     result_wb.save(output_path)
-
-    # DEBUG: in toàn bộ nội dung file output trước khi gửi về
+    # DEBUG
     wb_out = load_workbook(output_path)
     ws_out = wb_out.active
     print("==== File output preview ====")
@@ -115,12 +105,13 @@ def handle_excel(file_path, output_path):
         print(r)
     print("============================")
     if ws_out.max_row < 2:
-        raise Exception("Không crawl được link nào hợp lệ!")
+        await context.bot.send_message(chat_id=chat_id, text="Không crawl được link nào hợp lệ!")
+        return
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Gửi file Excel (.xlsx) gồm cột 'url'. Không cần cột 'type'.\n"
-        "Bot sẽ crawl và kiểm tra toàn bộ internal link cho bạn.\n"
+        "Gửi file Excel (.xlsx) gồm cột 'url'.\n"
+        "Bot sẽ báo cáo tất cả internal link cùng response code như Screaming Frog.\n"
         "Gửi /cancel để dừng tiến trình."
     )
 
@@ -138,12 +129,12 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output_path = f"output_{update.message.document.file_id}.xlsx"
     await file.download_to_drive(input_path)
 
-    await update.message.reply_text("Đang xử lý, vui lòng đợi...")
+    await update.message.reply_text("Đang xử lý, sẽ báo từng URL...")
 
     try:
-        handle_excel(input_path, output_path)
+        await handle_excel(input_path, output_path, context, chat_id)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            await update.message.reply_document(InputFile(output_path, filename="ketqua_internal_link.xlsx"))
+            await update.message.reply_document(InputFile(output_path, filename="internal_link_report.xlsx"))
         else:
             await context.bot.send_message(chat_id=chat_id, text="Không tạo được file kết quả hoặc file kết quả rỗng.")
     except Exception as ex:
