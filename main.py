@@ -5,6 +5,7 @@ import logging
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook, Workbook
 from dotenv import load_dotenv
+from openpyxl import load_workbook
 from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -97,6 +98,7 @@ async def handle_excel(
 ):
     wb = load_workbook(file_path)
     ws = wb.active
+        print(row)
     # Lấy header (dòng đầu tiên)
     headers = [cell.value for cell in ws[1]]
     url_idx = None
