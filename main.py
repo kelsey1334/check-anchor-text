@@ -5,7 +5,6 @@ import logging
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook, Workbook
 from dotenv import load_dotenv
-from openpyxl import load_workbook
 from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -13,7 +12,6 @@ from telegram.ext import (
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 logging.basicConfig(level=logging.INFO)
 
 USER_TASKS = {}
@@ -68,7 +66,6 @@ async def process_url(session, url, stt, page_type=None):
         return [stt, url, "Không truy cập được URL", url, "", "", ""]
     
     soup = BeautifulSoup(html, "html.parser")
-    # Nếu page_type không có, tự động detect
     if not page_type:
         page_type = detect_page_type(soup)
     if not page_type:
@@ -93,13 +90,10 @@ async def process_url(session, url, stt, page_type=None):
         result_row.append("")
     return result_row
 
-async def handle_excel(
-    file_path, output_path, context, chat_id, user_id
-):
+async def handle_excel(file_path, output_path, context, chat_id, user_id):
     wb = load_workbook(file_path)
     ws = wb.active
-        print(row)
-    # Lấy header (dòng đầu tiên)
+
     headers = [cell.value for cell in ws[1]]
     url_idx = None
     type_idx = None
@@ -140,15 +134,24 @@ async def handle_excel(
             row = await process_url(session, url, i, page_type)
             result_ws.append(row)
     result_wb.save(output_path)
-    # In debug để xác nhận file thực sự có data trước khi gửi về
-    print(f"Saved output: {output_path}")
-    print(f"File size: {os.path.getsize(output_path)} bytes")
+
+    # DEBUG: in toàn bộ nội dung file output trước khi gửi về
+    wb_out = load_workbook(output_path)
+    ws_out = wb_out.active
+    print("==== File output preview ====")
+    for r in ws_out.iter_rows(values_only=True):
+        print(r)
+    print("============================")
+
+    # Nếu không có dòng nào ngoài header, báo lỗi
+    if ws_out.max_row < 2:
+        await context.bot.send_message(chat_id=chat_id, text="Không có kết quả nào để xuất file.")
+        return
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Gửi file Excel (.xlsx) chứa danh sách URL cần kiểm tra.\n"
-        "File nên gồm 2 cột: url, type (post/page/category).\n"
-        "Nếu không có cột 'type', bot sẽ tự đoán loại trang.\n"
+        "Gửi file Excel (.xlsx) gồm cột 'url' (và tuỳ chọn cột 'type': post/page/category).\n"
+        "Nếu không có 'type', bot sẽ tự nhận diện.\n"
         "Gửi /cancel để dừng tiến trình."
     )
 
@@ -180,7 +183,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if os.path.exists(input_path): os.remove(input_path)
         if os.path.exists(output_path): os.remove(output_path)
-        USER_TASKS.pop(user_id, None)  # cleanup
+        USER_TASKS.pop(user_id, None)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
