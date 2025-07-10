@@ -1,6 +1,5 @@
 import os
-import asyncio
-import aiohttp
+import requests
 import logging
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook, Workbook
@@ -16,27 +15,7 @@ logging.basicConfig(level=logging.INFO)
 
 USER_TASKS = {}
 
-def detect_page_type(soup):
-    if soup.find('div', class_='article-inner'):
-        return 'post'
-    elif soup.find('div', id='content'):
-        return 'page'
-    elif soup.find('div', class_='taxonomy-description'):
-        return 'category'
-    return None
-
-def extract_content(soup, page_type):
-    if page_type == 'post':
-        node = soup.find('div', class_='article-inner')
-    elif page_type == 'page':
-        node = soup.find('div', id='content')
-    elif page_type == 'category':
-        node = soup.find('div', class_='taxonomy-description')
-    else:
-        return ""
-    return node.decode_contents() if node else ""
-
-def find_internal_links(html, base_url):
+def find_internal_links_from_html(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
@@ -44,95 +23,88 @@ def find_internal_links(html, base_url):
         anchor = a.text.strip()
         if not anchor:
             continue
-        if (href.startswith("/") or base_url in href):
+        # Logic internal: bắt đầu / hoặc có base_url (domain)
+        if href.startswith("/") or base_url in href:
             full_link = href if href.startswith("http") else base_url.rstrip("/") + "/" + href.lstrip("/")
             links.append((anchor, full_link))
     return links
 
-async def check_link_status(session, url):
+def get_base_url(url):
     try:
-        async with session.get(url, allow_redirects=True, timeout=10) as response:
-            return response.status
+        parts = url.split("//", 1)
+        main = parts[1].split("/", 1)[0]
+        return parts[0] + "//" + main
+    except Exception:
+        return url
+
+def check_link_status(url):
+    try:
+        r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'})
+        return r.status_code
     except Exception:
         return None
 
-async def process_url(session, url, stt, page_type=None):
+def process_url(url, stt):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
     try:
-        async with session.get(url, timeout=15) as resp:
-            if resp.status != 200:
-                return [stt, url, "Toàn bộ URL lỗi", url, "", "", ""]
-            html = await resp.text()
-    except Exception:
-        return [stt, url, "Không truy cập được URL", url, "", "", ""]
+        resp = requests.get(url, timeout=15, headers=headers)
+        status = resp.status_code
+        if status != 200:
+            return [stt, url, f"URL lỗi: status {status}", url]
+        html = resp.text
+    except Exception as e:
+        return [stt, url, f"Không truy cập được URL: {str(e)}", url]
     
-    soup = BeautifulSoup(html, "html.parser")
-    if not page_type:
-        page_type = detect_page_type(soup)
-    if not page_type:
-        return [stt, url, "Không nhận diện dạng bài", url, "", "", ""]
-    content = extract_content(soup, page_type)
-    if not content:
-        return [stt, url, "Không lấy được nội dung", url, "", "", ""]
-    base_url = url.split("//", 1)[-1].split("/", 1)[0]
-    base_url = url.split("//")[0] + "//" + base_url
-
-    internal_links = find_internal_links(content, base_url)
+    base_url = get_base_url(url)
+    internal_links = find_internal_links_from_html(html, base_url)
     result_row = [stt, url]
-    anchor_error = 0
+    error_found = False
     for anchor, link in internal_links:
-        code = await check_link_status(session, link)
+        code = check_link_status(link)
         if code in [301, 404]:
-            anchor_error += 1
-            result_row.append(f"{anchor} - {link}")
-            if anchor_error == 4:
-                break
-    while len(result_row) < 6:
-        result_row.append("")
+            error_found = True
+            result_row.append(f"{anchor} - {link} (status {code})")
+    if not error_found:
+        result_row.append("OK")
     return result_row
 
-async def handle_excel(file_path, output_path, context, chat_id, user_id):
+def handle_excel(file_path, output_path):
     wb = load_workbook(file_path)
     ws = wb.active
-
     headers = [cell.value for cell in ws[1]]
     url_idx = None
-    type_idx = None
     for idx, val in enumerate(headers):
         if val and str(val).strip().lower() == 'url':
             url_idx = idx
-        if val and str(val).strip().lower() == 'type':
-            type_idx = idx
     if url_idx is None:
-        await context.bot.send_message(chat_id=chat_id, text="Không tìm thấy cột 'url' trong file.")
-        return
-
-    urls_types = []
-    for row in ws.iter_rows(min_row=2, max_col=max(url_idx, type_idx if type_idx is not None else 0)+1):
+        raise Exception("Không tìm thấy cột 'url' trong file.")
+    urls = []
+    for row in ws.iter_rows(min_row=2, max_col=url_idx+1):
         url = row[url_idx].value if url_idx < len(row) else None
-        page_type = None
-        if type_idx is not None and type_idx < len(row):
-            page_type = row[type_idx].value
-            if page_type:
-                page_type = str(page_type).strip().lower()
         if url:
-            urls_types.append((url, page_type))
+            urls.append(url)
 
+    result_rows = []
+    max_error = 0
+
+    for i, url in enumerate(urls, 1):
+        row = process_url(url, i)
+        # trừ 2 cột đầu là stt, url
+        num_error = len(row) - 2
+        max_error = max(max_error, num_error)
+        result_rows.append(row)
+
+    # Header động, số cột lỗi tối đa từng gặp
+    header = ['stt', 'url check'] + [f'anchor lỗi {i+1}' for i in range(max_error if max_error > 0 else 1)]
     result_wb = Workbook()
     result_ws = result_wb.active
-    result_ws.append([
-        'stt', 'url check', 
-        'anchor bị lỗi và link lỗi 1', 'anchor bị lỗi và link lỗi 2', 
-        'anchor bị lỗi và link lỗi 3', 'anchor bị lỗi và link lỗi 4'
-    ])
+    result_ws.append(header)
 
-    async with aiohttp.ClientSession() as session:
-        for i, (url, page_type) in enumerate(urls_types, 1):
-            if USER_TASKS.get(user_id, {}).get("cancel", False):
-                await context.bot.send_message(chat_id=chat_id, text=f"Đã dừng tiến trình theo yêu cầu! Dừng ở dòng {i}/{len(urls_types)}.")
-                break
-            await context.bot.send_message(chat_id=chat_id, text=f"Đang kiểm tra {i}/{len(urls_types)}: {url} ({page_type if page_type else 'auto'})")
-            row = await process_url(session, url, i, page_type)
-            result_ws.append(row)
+    # Fill dòng cho đủ cột
+    for row in result_rows:
+        while len(row) < len(header):
+            row.append("")
+        result_ws.append(row)
     result_wb.save(output_path)
 
     # DEBUG: in toàn bộ nội dung file output trước khi gửi về
@@ -142,16 +114,13 @@ async def handle_excel(file_path, output_path, context, chat_id, user_id):
     for r in ws_out.iter_rows(values_only=True):
         print(r)
     print("============================")
-
-    # Nếu không có dòng nào ngoài header, báo lỗi
     if ws_out.max_row < 2:
-        await context.bot.send_message(chat_id=chat_id, text="Không có kết quả nào để xuất file.")
-        return
+        raise Exception("Không crawl được link nào hợp lệ!")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Gửi file Excel (.xlsx) gồm cột 'url' (và tuỳ chọn cột 'type': post/page/category).\n"
-        "Nếu không có 'type', bot sẽ tự nhận diện.\n"
+        "Gửi file Excel (.xlsx) gồm cột 'url'. Không cần cột 'type'.\n"
+        "Bot sẽ crawl và kiểm tra toàn bộ internal link cho bạn.\n"
         "Gửi /cancel để dừng tiến trình."
     )
 
@@ -169,11 +138,10 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output_path = f"output_{update.message.document.file_id}.xlsx"
     await file.download_to_drive(input_path)
 
-    await update.message.reply_text("Đang xử lý, vui lòng đợi... (có thể gửi /cancel để dừng lại)")
+    await update.message.reply_text("Đang xử lý, vui lòng đợi...")
 
     try:
-        await handle_excel(input_path, output_path, context, chat_id, user_id)
-        # Kiểm tra file output thực tế có tồn tại và có dữ liệu không
+        handle_excel(input_path, output_path)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             await update.message.reply_document(InputFile(output_path, filename="ketqua_internal_link.xlsx"))
         else:
