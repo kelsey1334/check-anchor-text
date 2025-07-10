@@ -1,5 +1,4 @@
 import os
-import requests
 import asyncio
 import aiohttp
 import logging
@@ -98,7 +97,7 @@ async def handle_excel(
 ):
     wb = load_workbook(file_path)
     ws = wb.active
-    # Lấy header (giả sử dòng đầu tiên)
+    # Lấy header (dòng đầu tiên)
     headers = [cell.value for cell in ws[1]]
     url_idx = None
     type_idx = None
@@ -111,7 +110,6 @@ async def handle_excel(
         await context.bot.send_message(chat_id=chat_id, text="Không tìm thấy cột 'url' trong file.")
         return
 
-    # Đọc dữ liệu từng dòng
     urls_types = []
     for row in ws.iter_rows(min_row=2, max_col=max(url_idx, type_idx if type_idx is not None else 0)+1):
         url = row[url_idx].value if url_idx < len(row) else None
@@ -133,21 +131,22 @@ async def handle_excel(
 
     async with aiohttp.ClientSession() as session:
         for i, (url, page_type) in enumerate(urls_types, 1):
-            # Kiểm tra cờ huỷ
             if USER_TASKS.get(user_id, {}).get("cancel", False):
                 await context.bot.send_message(chat_id=chat_id, text=f"Đã dừng tiến trình theo yêu cầu! Dừng ở dòng {i}/{len(urls_types)}.")
                 break
             await context.bot.send_message(chat_id=chat_id, text=f"Đang kiểm tra {i}/{len(urls_types)}: {url} ({page_type if page_type else 'auto'})")
             row = await process_url(session, url, i, page_type)
             result_ws.append(row)
-            # Có thể gửi log sau mỗi 5 dòng nếu muốn
     result_wb.save(output_path)
+    # In debug để xác nhận file thực sự có data trước khi gửi về
+    print(f"Saved output: {output_path}")
+    print(f"File size: {os.path.getsize(output_path)} bytes")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Gửi file Excel (.xlsx) chứa danh sách URL cần kiểm tra.\n"
-        "Có thể gửi dạng 2 cột: url, type (post/page/category).\n"
-        "Nếu không có cột 'type', bot sẽ tự đoán.\n"
+        "File nên gồm 2 cột: url, type (post/page/category).\n"
+        "Nếu không có cột 'type', bot sẽ tự đoán loại trang.\n"
         "Gửi /cancel để dừng tiến trình."
     )
 
@@ -169,14 +168,16 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await handle_excel(input_path, output_path, context, chat_id, user_id)
+        # Kiểm tra file output thực tế có tồn tại và có dữ liệu không
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            await update.message.reply_document(InputFile(output_path, filename="ketqua_internal_link.xlsx"))
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="Không tạo được file kết quả hoặc file kết quả rỗng.")
     except Exception as ex:
         await context.bot.send_message(chat_id=chat_id, text=f"Lỗi: {ex}")
     finally:
         if os.path.exists(input_path): os.remove(input_path)
-        if os.path.exists(output_path):
-            if not USER_TASKS.get(user_id, {}).get("cancel", False):
-                await update.message.reply_document(InputFile(output_path, filename="ketqua_internal_link.xlsx"))
-            os.remove(output_path)
+        if os.path.exists(output_path): os.remove(output_path)
         USER_TASKS.pop(user_id, None)  # cleanup
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
