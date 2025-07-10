@@ -5,8 +5,7 @@ import aiohttp
 import logging
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook, Workbook
-from python_dotenv import load_dotenv
-
+from dotenv import load_dotenv
 from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
